@@ -7,7 +7,7 @@ and assembles them into full conversation threads. Each message is wrapped with 
 The resulting conversations are then sharded into multiple JSONL files for easy loading by a dataloader.
 
 Usage:
-    python3 prepare_conversations.py \
+    python3 prep.py \
       --input all_messages.jsonl \
       --output_dir shards/ \
       --num_shards 10
@@ -28,12 +28,14 @@ Each line in each shard is a JSON object:
 import os
 import json
 import argparse
-from collections import defaultdict
-from math import ceil
 from transformers import AutoTokenizer
 
-# Initialize the Llama 3 tokenizer
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3-8b")
+SAME_USER_THRESHOLD = 300      # 5 minutes in seconds
+CONVO_BREAK_THRESHOLD = 3600 * 24   # 24 hours in seconds
+HISTORY_MAX_TOKENS = 2048      # adjust as needed
+STRIDE = 512                   # overlap for long convos
+
+tokenizer = AutoTokenizer.from_pretrained("unsloth/Meta-Llama-3.1-8B-bnb-4bit")
 
 def count_tokens(text):
     """
@@ -43,81 +45,93 @@ def count_tokens(text):
     return len(tokens)
 
 
-def load_messages(input_path):
-    """
-    Load messages from a JSONL file. Each line should be a JSON object with keys:
-      - conversation_id (string)
-      - is_from_me (bool)           # not used in ordering, but kept if needed
-      - text (string)
-      - date (integer or string)    # raw date field, used for sorting
-    Returns a dict mapping conversation_id -> list of message dicts.
-    """
-    conv_dict = defaultdict(list)
-    with open(input_path, "r", encoding="utf-8") as fin:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
+def parse_messages(input_path):
+    # Read and filter messages
+    conversations = {}
+    with open(input_path, "r", encoding="utf-8") as f:
+        for line in f:
             msg = json.loads(line)
-            # Expect keys: "conversation_id", "is_from_me", "text", "date"
             cid = msg["conversation_id"]
-            conv_dict[cid].append(msg)
-    return conv_dict
+            if cid == "UNKNOWN":
+                continue
+            conversations.setdefault(cid, []).append({
+                "sender": cid,
+                "ts": float(msg["date"]) / 1e9,  # assuming nanoseconds
+                "text": msg["text"],
+                "is_from_me": msg["is_from_me"]
+            })
+    # Sort each conversation by timestamp
+    for msgs in conversations.values():
+        msgs.sort(key=lambda m: m["ts"])
+    return conversations
 
 
-def build_conversation_text(messages):
-    """
-    Given a list of message dicts (each with "text" and "date"), sort by date (ascending)
-    and wrap each text in <|im start> and <|im end> tokens. Return the concatenated string.
-    """
-    # Sort by raw date value; assumes date is comparable (int or ISO string)
-    sorted_msgs = sorted(messages, key=lambda m: m["date"])
-    pieces = []
-    for msg in sorted_msgs:
-        text = msg["text"].replace("\n", " ")  # replace newlines to keep one line
-        # wrap with tokens
-        pieces.append(f"<|im start> {text} <|im end>")
-    # Join without extra spaces to form a continuous sequence
-    return "".join(pieces)
+def assign_roles(messages):
+    for m in messages:
+        m["role"] = "<|ME|>" if m["is_from_me"] else "<|OTHER|>"
+    return messages
 
 
-def shard_conversations(conversation_texts, num_shards, output_dir):
-    """
-    Given a list of (conversation_id, text) tuples, shard them into num_shards based on token counts.
-    Writes out JSONL files under output_dir: shard_0.jsonl, shard_1.jsonl, ...
-    """
-    # Calculate token counts for each conversation
-    conversation_tokens = [(cid, text, count_tokens(text)) for cid, text in conversation_texts]
-    
-    # Sort conversations by token count (descending) for better distribution
-    conversation_tokens.sort(key=lambda x: x[2], reverse=True)
-    
-    # Initialize shards with token counts
-    shards = [[] for _ in range(num_shards)]
-    shard_token_counts = [0] * num_shards
-    
-    # Distribute conversations to balance token counts
-    for cid, text, token_count in conversation_tokens:
-        # Find the shard with the minimum token count
-        min_idx = shard_token_counts.index(min(shard_token_counts))
-        shards[min_idx].append((cid, text))
-        shard_token_counts[min_idx] += token_count
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Write each shard to a file
-    for shard_idx, shard_items in enumerate(shards):
-        shard_path = os.path.join(output_dir, f"shard_{shard_idx}.jsonl")
-        with open(shard_path, "w", encoding="utf-8") as fout:
-            for cid, text in shard_items:
-                rec = {"conversation_id": cid, "text": text}
-                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"Wrote {len(shard_items)} conversations ({shard_token_counts[shard_idx]} tokens) to {shard_path}")
+def collapse_bursts(messages):
+    collapsed = []
+    prev_role = None
+    prev_ts = None
+    burst = []
+    for m in messages:
+        delta = m["ts"] - prev_ts if prev_ts is not None else 9999
+        if (m["role"] != prev_role) or (delta > SAME_USER_THRESHOLD):
+            if burst:
+                # Collapse previous burst
+                collapsed.append({
+                    "role": prev_role,
+                    "ts": burst[0]["ts"],
+                    "delta": burst[0]["ts"] - (collapsed[-1]["ts"] if collapsed else 0),
+                    "text": "\n".join(b["text"].strip() for b in burst)
+                })
+            burst = [m]
+        else:
+            burst.append(m)
+        prev_role = m["role"]
+        prev_ts = m["ts"]
+    if burst:
+        collapsed.append({
+            "role": prev_role,
+            "ts": burst[0]["ts"],
+            "delta": burst[0]["ts"] - (collapsed[-1]["ts"] if collapsed else 0),
+            "text": "\n".join(b["text"].strip() for b in burst)
+        })
+    return collapsed
+
+
+def build_turns(collapsed):
+    turns = []
+    for c in collapsed:
+        dt = "<|DT_SHORT|>" if c["delta"] < 300 else "<|DT_LONG|>"
+        turn = f"{dt} {c['role']} {c['text']}"
+        turns.append({"turn": turn, "ts": c["ts"]})
+    return turns
+
+
+def chunk_conversations(turns):
+    chunks = []
+    chunk = []
+    prev_ts = None
+    for t in turns:
+        # Conversation break if delta > 1hr
+        if prev_ts is not None and (t["ts"] - prev_ts > CONVO_BREAK_THRESHOLD):
+            if chunk:
+                chunks.append("\n".join(x["turn"] for x in chunk))
+            chunk = []
+        chunk.append(t)
+        prev_ts = t["ts"]
+    if chunk:
+        chunks.append("\n".join(x["turn"] for x in chunk))
+    return chunks
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Assemble messages into conversation threads and shard them by token count."
+        description="Assemble messages into conversation threads and chunk them by token count."
     )
     parser.add_argument(
         "--input",
@@ -126,23 +140,12 @@ def main():
         help="Path to input JSONL (e.g. all_messages.jsonl)",
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Directory where shard files will be written",
-    )
-    parser.add_argument(
-        "--num_shards",
-        type=int,
-        default=10,
-        help="Number of shards to split into (default: 10)",
-    )
-    parser.add_argument(
         "--model_name",
         type=str,
         default="meta-llama/Llama-3-8b",
         help="Tokenizer model name to use (default: meta-llama/Llama-3-8b)",
     )
+    parser.add_argument("--output", type=str, default="train.jsonl")
     args = parser.parse_args()
     
     # Update tokenizer if a different model is specified
@@ -150,19 +153,19 @@ def main():
     if args.model_name != "meta-llama/Llama-3-8b":
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    # 1) Load and group messages by conversation_id
-    conv_dict = load_messages(args.input)
-
-    # 2) Build full conversation text for each conversation_id
-    conversation_texts = []
-    for cid, msgs in conv_dict.items():
-        if len(msgs) < 1:
-            continue
-        convo_text = build_conversation_text(msgs)
-        conversation_texts.append((cid, convo_text))
-
-    # 3) Shard and write out JSONL files using token-based distribution
-    shard_conversations(conversation_texts, args.num_shards, args.output_dir)
+    # New pipeline: parse, assign roles, collapse, build, chunk, write
+    conversations = parse_messages(args.input)
+    total_chunks = 0
+    with open(args.output, "w", encoding="utf-8") as f:
+        for cid, messages in conversations.items():
+            messages = assign_roles(messages)
+            collapsed = collapse_bursts(messages)
+            turns = build_turns(collapsed)
+            chunks = chunk_conversations(turns)
+            for chunk in chunks:
+                f.write(json.dumps({"conversation_id": cid, "text": chunk}, ensure_ascii=False) + "\n")
+                total_chunks += 1
+    print(f"Wrote {total_chunks} conversation chunks to {args.output}")
 
 
 if __name__ == "__main__":

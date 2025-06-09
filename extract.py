@@ -12,7 +12,7 @@ Example output line:
 }
 
 Usage:
-    python3 dump_imessages_with_date.py [--db ~/Library/Messages/chat.db] [--out all_messages.jsonl]
+    python3 extract.py [--db ~/Library/Messages/chat.db] [--out all_messages.jsonl]
 """
 
 import sqlite3
@@ -34,7 +34,7 @@ def main():
     parser.add_argument(
         "--out",
         type=str,
-        default="test/all_messages.jsonl",
+        default="messages/all_messages.jsonl",
         help="Output JSONL file (default: all_messages.jsonl)",
     )
     args = parser.parse_args()
@@ -59,14 +59,26 @@ def main():
     # Query every non-null text message with a non-null handle_id (skip group chats)
     cursor.execute("""
         SELECT
-            text,
-            handle_id,
-            is_from_me,
-            date
-        FROM message
-        WHERE text IS NOT NULL
-          AND handle_id IS NOT NULL
-        ORDER BY handle_id, date
+            m.text,
+            m.handle_id,
+            m.is_from_me,
+            m.date,
+            -- For outgoing messages, get the handle_id from chat_handle_join
+            (
+                SELECT h.id
+                FROM chat_message_join cmj
+                JOIN chat_handle_join chj ON cmj.chat_id = chj.chat_id
+                JOIN handle h ON chj.handle_id = h.ROWID
+                WHERE cmj.message_id = m.ROWID
+                LIMIT 1
+            ) AS outgoing_handle_string
+        FROM message m
+        WHERE m.text IS NOT NULL
+          AND (
+                m.handle_id IS NOT NULL
+                OR m.is_from_me = 1
+              )
+        ORDER BY COALESCE(m.handle_id, outgoing_handle_string), m.date
     """)
     all_messages = cursor.fetchall()
 
@@ -74,8 +86,13 @@ def main():
     output_path = args.out
     with open(output_path, "w", encoding="utf-8") as fout:
         for msg in all_messages:
-            h_id = msg["handle_id"]
-            handle_str = handles.get(h_id, "UNKNOWN")
+            if msg["is_from_me"]:
+                # Use outgoing_handle_string for sent messages
+                handle_str = msg["outgoing_handle_string"] or "UNKNOWN"
+            else:
+                # Use handle_id for received messages
+                h_id = msg["handle_id"]
+                handle_str = handles.get(h_id, "UNKNOWN")
 
             rec = {
                 "conversation_id": handle_str,
