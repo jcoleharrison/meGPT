@@ -1,54 +1,42 @@
-#!/usr/bin/env python3
 """
-prepare_conversations.py
-
-Reads a JSONL file of individual iMessage/SMS messages (with fields: conversation_id, is_from_me, text, date)
-and assembles them into full conversation threads. Each message is wrapped with <|im start> and <|im end> tokens.
-The resulting conversations are then sharded into multiple JSONL files for easy loading by a dataloader.
+prep.py
 
 Usage:
     python3 prep.py \
       --input all_messages.jsonl \
-      --output_dir shards/ \
-      --num_shards 10
+      --output train.jsonl \
+      [--model_name unsloth/Meta-Llama-3.1-8B-bnb-4bit]
 
-Outputs:
-    shards/shard_0.jsonl
-    shards/shard_1.jsonl
-    ...
-    shards/shard_{num_shards-1}.jsonl
+Arguments:
+    --input       Path to input JSONL (e.g. all_messages.jsonl) [required]
+    --output      Path to output JSONL (default: train.jsonl)
+    --model_name  Tokenizer model name to use (default: unsloth/Meta-Llama-3.1-8B-bnb-4bit)
 
-Each line in each shard is a JSON object:
+Each line in the output is a JSON object:
 {
     "conversation_id": "<phone_or_email>",
-    "text": "<|im start> Message1 <|im end><|im start> Message2 <|im end>..."
+    "text": "<|DT_SHORT|> <|ME|> ...",
+    "num_tokens": <int>
 }
 """
 
-import os
 import json
 import argparse
+from pathlib import Path
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 SAME_USER_THRESHOLD = 300      # 5 minutes in seconds
 CONVO_BREAK_THRESHOLD = 3600 * 24   # 24 hours in seconds
 HISTORY_MAX_TOKENS = 2048      # adjust as needed
 STRIDE = 512                   # overlap for long convos
-
-tokenizer = AutoTokenizer.from_pretrained("unsloth/Meta-Llama-3.1-8B-bnb-4bit")
-
-def count_tokens(text):
-    """
-    Count the number of tokens in a text using the Llama 3 tokenizer.
-    """
-    tokens = tokenizer.encode(text)
-    return len(tokens)
+SPECIAL_TOKENS = ["<|DT_SHORT|>", "<|DT_LONG|>", "<|ME|>", "<|OTHER|>"]
 
 
 def parse_messages(input_path):
-    # Read and filter messages
+    """Read JSONL and return dict of sorted message lists per conversation."""
     conversations = {}
-    with open(input_path, "r", encoding="utf-8") as f:
+    with input_path.open("r", encoding="utf-8") as f:
         for line in f:
             msg = json.loads(line)
             cid = msg["conversation_id"]
@@ -67,6 +55,7 @@ def parse_messages(input_path):
 
 
 def assign_roles(messages):
+    """Tag each message with ME or OTHER role."""
     for m in messages:
         m["role"] = "<|ME|>" if m["is_from_me"] else "<|OTHER|>"
     return messages
@@ -129,6 +118,34 @@ def chunk_conversations(turns):
     return chunks
 
 
+def load_tokenizer(model_name: str):
+    """Load pretrained tokenizer and register special tokens."""
+    tok = AutoTokenizer.from_pretrained(model_name)
+    tok.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
+    return tok
+
+
+def tokenize_text(text, tokenizer):
+    """Return list of token IDs for given text."""
+    return tokenizer(text, add_special_tokens=False).input_ids
+
+
+def split_long_conversations(input_ids):
+    """Split list of token IDs into overlapping chunks of max HISTORY_MAX_TOKENS."""
+    num_tokens = len(input_ids)
+    if num_tokens <= HISTORY_MAX_TOKENS:
+        return [input_ids]
+    subs = []
+    start = 0
+    while start < num_tokens:
+        end = min(start + HISTORY_MAX_TOKENS, num_tokens)
+        subs.append(input_ids[start:end])
+        if end == num_tokens:
+            break
+        start += STRIDE
+    return subs
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Assemble messages into conversation threads and chunk them by token count."
@@ -142,29 +159,39 @@ def main():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="meta-llama/Llama-3-8b",
-        help="Tokenizer model name to use (default: meta-llama/Llama-3-8b)",
+        default="unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+        help="Tokenizer model name to use (default: unsloth/Meta-Llama-3.1-8B-bnb-4bit)",
     )
     parser.add_argument("--output", type=str, default="train.jsonl")
     args = parser.parse_args()
     
-    # Update tokenizer if a different model is specified
-    global tokenizer
-    if args.model_name != "meta-llama/Llama-3-8b":
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    args.input = Path(args.input)
+    args.output = Path(args.output)
+    print(f"Loading tokenizer: {args.model_name}")
+    tokenizer = load_tokenizer(args.model_name)
 
-    # New pipeline: parse, assign roles, collapse, build, chunk, write
+    print(f"Parsing messages from {args.input} ...")
     conversations = parse_messages(args.input)
+
     total_chunks = 0
-    with open(args.output, "w", encoding="utf-8") as f:
-        for cid, messages in conversations.items():
+    with args.output.open("w", encoding="utf-8") as f:
+        for cid, messages in tqdm(conversations.items(), desc="Conversations"):
             messages = assign_roles(messages)
             collapsed = collapse_bursts(messages)
             turns = build_turns(collapsed)
             chunks = chunk_conversations(turns)
             for chunk in chunks:
-                f.write(json.dumps({"conversation_id": cid, "text": chunk}, ensure_ascii=False) + "\n")
-                total_chunks += 1
+                # tokenize once
+                ids = tokenize_text(chunk, tokenizer)
+                # split into ID-subsequences
+                for sub_ids in split_long_conversations(ids):
+                    text = tokenizer.decode(sub_ids, skip_special_tokens=True)
+                    f.write(json.dumps({
+                        "conversation_id": cid,
+                        "text": text,
+                        "input_ids": sub_ids
+                    }, ensure_ascii=False) + "\n")
+                    total_chunks += 1
     print(f"Wrote {total_chunks} conversation chunks to {args.output}")
 
 
