@@ -1,7 +1,12 @@
-imessage_dump
-shards
-output.jsonl
+# Ignore data files
 dataset_splits
+logs
+outputs
 messages
 train.jsonl
+imessage_dump
 wandb
+
+# Ignore standard Python cache files
+__pycache__
+.vscode
