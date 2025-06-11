@@ -159,8 +159,8 @@ def main():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="unsloth/Meta-Llama-3.1-8B-bnb-4bit",
-        help="Tokenizer model name to use (default: unsloth/Meta-Llama-3.1-8B-bnb-4bit)",
+        default="unsloth/Llama-3.2-3B-bnb-4bit",
+        help="Tokenizer model name to use (default: unsloth/Llama-3.2-3B-bnb-4bit)",
     )
     parser.add_argument("--output", type=str, default="train.jsonl")
     args = parser.parse_args()
@@ -185,11 +185,12 @@ def main():
                 ids = tokenize_text(chunk, tokenizer)
                 # split into ID-subsequences
                 for sub_ids in split_long_conversations(ids):
-                    text = tokenizer.decode(sub_ids, skip_special_tokens=True)
+                    # Fix: Decode the tokens back to text for Trainer
+                    text = tokenizer.decode(sub_ids, skip_special_tokens=False)
                     f.write(json.dumps({
                         "conversation_id": cid,
                         "text": text,
-                        "input_ids": sub_ids
+                        "num_tokens": len(sub_ids)  # Fix: Use num_tokens instead of input_ids
                     }, ensure_ascii=False) + "\n")
                     total_chunks += 1
     print(f"Wrote {total_chunks} conversation chunks to {args.output}")
