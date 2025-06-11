@@ -9,6 +9,5 @@ This project is to ...
 - Run prep.py to get data prepped and tokenized into a ready-to-train format
 
 ```
-pip install --upgrade transformers accelerate bitsandbytes peft datasets
-
+pip install --upgrade transformers accelerate bitsandbytes peft datasets "uvicorn[standard]" fastapi
 ```
