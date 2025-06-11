@@ -34,7 +34,7 @@ def parse_args():
                         default="unsloth/Llama-3.2-3B-bnb-4bit")
     parser.add_argument("--train_file",    type=str, default="train.jsonl")
     parser.add_argument("--output_dir",    type=str, default="outputs")
-    parser.add_argument("--batch_size",    type=int, default=1)
+    parser.add_argument("--batch_size",    type=int, default=2)
     parser.add_argument("--epochs",     type=int, default=5)
     parser.add_argument("--lr",            type=float, default=2e-4)
     parser.add_argument("--seed",          type=int, default=3407)
@@ -222,7 +222,7 @@ def main():
     train_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=8 // args.batch_size,
         max_steps=5,
         # num_train_epochs=args.epochs,
         learning_rate=args.lr,
