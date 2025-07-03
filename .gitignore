@@ -5,7 +5,9 @@ outputs
 messages
 train.jsonl
 imessage_dump
+shards
 wandb
+output.jsonl
 
 # Ignore standard Python cache files
 __pycache__
